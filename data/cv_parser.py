@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Any
 import ollama
 
 # ====== CONFIG ======
-OUTPUT_DIR = r"D:\cvproj\data\outputs"
+OUTPUT_DIR = r"DD:\cvprojfiles\outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 OCR_LANG = "eng"
