@@ -25,47 +25,40 @@
 - python-docx
 - tkinter
 
-## Installation
+  ## Installation
 ```bash
 pip install python-docx pymupdf pillow pytesseract
 # Install and run Ollama + pull mistral model separately
 # Ensure Tesseract is installed on the OS and accessible in PATH
+```
 
-## Usage
-
+Usage
 CLI (recommended):
-
+```bash
 python cv_parser.py <files|folders> --recursive --job-title "Mechanical Engineer"
-
-
-## GUI (fallback):
+```
+GUI (fallback):
 
 Run without arguments; a dialog will ask you to choose files or a folder and optionally a job title.
 
 Examples:
 
+```bash
 # Process a folder recursively and set a Job Title override
 python cv_parser.py D:\CVs --recursive --job-title "Electrical Engineer"
 
 # Process specific files
 python cv_parser.py D:\CVs\cv1.pdf D:\CVs\cv2.docx
-
+```
 Output
-
 All DOCX reports are saved to:
-
 D:\cvprojfiles\outputs
 
-
 File naming:
-
 <original_filename>_parsed.docx
-
-
 If a name collision occurs, an incremental suffix is added.
 
-Notes and Assumptions
-
+  ## Notes and Assumptions
 Supported inputs: .pdf, .docx, .doc
 
 OCR language default: English (OCR_LANG = "eng")
@@ -77,7 +70,6 @@ If the LLM output is partial or malformed, the script auto-cleans JSON and merge
 The script attempts to infer names from the document, email, or filename if missing.
 
 Project Structure (key parts)
-
 Robust section normalization via SECTION_ALIASES
 
 Safe JSON parsing with cleanup (safe_json_loads)
@@ -88,8 +80,7 @@ DOCX layout helpers for header box, key/value tables, colon-aligned lists, and f
 
 Batch runner with per-file error handling
 
-Roadmap
-
+## Roadmap
 Multi-language OCR support
 
 Additional LLM schemas and models
