@@ -32,11 +32,12 @@ from docx.oxml.ns import qn
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime
 import ollama
 
 # ====== CONFIG ======
-OUTPUT_DIR = r"DD:\cvprojfiles\outputs"
+OUTPUT_DIR = r"D:\cvprojfiles\outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 OCR_LANG = "eng"
@@ -364,11 +365,11 @@ def normalize_language_level(level: str) -> str:
     if not level:
         return "Not specified"
     level = level.lower()
-    if "mother" in level or "native" in level: return "Native"
+    if "mother" in level or "native" in level: return "Native Language"
     if "fluent" in level: return "Fluent"
     if "excellent" in level or "very good" in level: return "Very Good"
     if "good" in level and "very" not in level: return "Good"
-    if "fair" in level or "basic" in level: return "Fair"
+    if "fair" in level or "basic" in level: return "Intermediate" if "intermediate" in level else "Fair"
     return "Not specified"
 
 DATE_PATTERNS = [
@@ -537,15 +538,15 @@ def extract_languages_from_text(cv_text: str) -> List[str]:
         "italian": "Italian", "spanish": "Spanish", "turkish": "Turkish", "hindi": "Hindi"
     }
     levels_map = {
-        "mother tongue": "Native", "native": "Native",
+        "mother tongue": "Native Language", "native": "Native Language",
         "fluent": "Fluent",
         "excellent": "Very Good", "very good": "Very Good",
         "good": "Good",
-        "fair": "Fair", "basic": "Basic",
+        "fair": "Fair", "basic": "Basic", "intermediate": "Intermediate",
         "reading and writing": "Good",
     }
     lines = [l.strip() for l in cv_text.splitlines() if l.strip()]
-    rank = ["Not specified","Basic","Fair","Good","Very Good","Fluent","Native"]
+    rank = ["Not specified","Basic","Fair","Good","Very Good","Fluent","Native Language"]
 
     found = {}
     for ln in lines:
@@ -562,7 +563,7 @@ def extract_languages_from_text(cv_text: str) -> List[str]:
                     found[L] = level
 
     if not found and re.search(r"(?i)Arabic.*mother tongue|mother tongue.*Arabic", cv_text):
-        found["Arabic"] = "Native"
+        found["Arabic"] = "Native Language"
 
     return [f"{lang}: {lvl}" for lang, lvl in found.items()]
 
@@ -637,8 +638,47 @@ def extract_experience_from_text(cv_text: str) -> List[dict]:
             m_comp = re.search(LABELS["company"] + r"\s*[: ]\s*([A-Za-z0-9 .,&\-()/]+)", context, re.I)
             company = strip_trailing_punct(m_comp.group(1)) if m_comp else ""
 
+            # original lookup
             m_pos = re.search(LABELS["position"] + r"\s*[: ]\s*([A-Za-z0-9 .,&\-()/]+)", context, re.I)
             position = strip_trailing_punct(m_pos.group(1)) if m_pos else ""
+
+            # --- Robust fallbacks (purely additive; logic intact) ---
+            if not position:
+                # A) nearby labeled lines
+                window = lines[max(0, i-3): min(i+8, len(lines))]
+                for wl in window:
+                    m_lbl = re.search(r"(?i)^(job\s*title|position|title|designation|role)\s*[:\-]\s*(.+)$", wl.strip())
+                    if m_lbl:
+                        position = strip_trailing_punct(m_lbl.group(2))
+                        break
+
+            if not position:
+                # B) company/employer line then next line looks like a title
+                for idx in range(max(0, i-3), min(i+8, len(lines))):
+                    if re.search(r"(?i)^(company|employer)\s*[:\-]", lines[idx]):
+                        if idx + 1 < len(lines):
+                            possible = lines[idx + 1].strip()
+                            if (3 <= len(possible) <= 80
+                                and not re.search(r"(?i)^(dates?|project|job\s*description)\b", possible)
+                                and not re.search(r"(?i)\bfrom\b|\bto\b", possible)
+                                and not re.search(r"[@]", possible)):
+                                position = strip_trailing_punct(possible)
+                                break
+
+            if not position:
+                # C) capitalized phrase that looks like a title
+                for wl in lines[max(0, i-3): min(i+8, len(lines))]:
+                    s = wl.strip()
+                    if (3 <= len(s) <= 80
+                        and not re.search(r"(?i)^(company|employer|dates?|project|job\s*description)\b", s)
+                        and not re.search(r"(?i)\bfrom\b|\bto\b", s)
+                        and not re.search(r"[@]", s)):
+                        toks = s.split()
+                        caps = sum(bool(re.match(r"^[A-Z][A-Za-z()&/\-]+$", t)) for t in toks)
+                        if caps >= 2:
+                            position = strip_trailing_punct(s)
+                            break
+
             if not position:
                 m_pos2 = re.search(r"(?i)\b(As\s+)?([A-Z][A-Za-z ]{2,60})(?: at | with |,|\.|$)", context)
                 if m_pos2:
@@ -687,8 +727,7 @@ def extract_experience_from_text(cv_text: str) -> List[dict]:
             dedup.append(r)
     return dedup
 
-# ====== DOCX OUTPUT (STYLING-ONLY CHANGES) ======
-
+# ====== DOCX OUTPUT (STYLING) ======
 def set_page_margins(doc, top=0.69, bottom=0.87, left=0.87, right=0.87):
     """Apply requested page margins in inches."""
     for section in doc.sections:
@@ -698,31 +737,22 @@ def set_page_margins(doc, top=0.69, bottom=0.87, left=0.87, right=0.87):
         section.right_margin = Inches(right)
 
 def _twips(inches: float) -> int:
-    # 1 inch = 1440 twips
-    return int(round(inches * 1440))
+    return int(round(inches * 1440))  # 1 inch = 1440 twips
 
 def add_name_job_rectangle(doc, name: str, job_title: str):
-    """
-    Header box:
-    - Right-aligned
-    - Stretched to full content width (between margins)
-    - Thin black border
-    - Tight internal padding and paragraph spacing
-    """
+    """Right-aligned header box stretched to full content width; thin black border."""
     table = doc.add_table(rows=2, cols=1)
     table.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
     table.autofit = False
 
-    # Compute content width = page width - left/right margins
     section = doc.sections[0]
     content_width_in = section.page_width.inches - section.left_margin.inches - section.right_margin.inches
-    # set python-docx column width (inches)
+
     try:
-        table.columns[0].width = Inches(max(content_width_in - 0.02, 1.0))  # tiny safety offset
+        table.columns[0].width = Inches(max(content_width_in - 0.02, 1.0))
     except Exception:
         pass
 
-    # Ensure tblPr exists
     tbl = table._element
     if tbl.tblPr is None:
         tblPr = OxmlElement('w:tblPr')
@@ -730,33 +760,30 @@ def add_name_job_rectangle(doc, name: str, job_title: str):
     else:
         tblPr = tbl.tblPr
 
-    # Explicit table width (so Word keeps it wide)
     tblW = OxmlElement('w:tblW')
     tblW.set(qn('w:w'), str(_twips(content_width_in)))
     tblW.set(qn('w:type'), 'dxa')
     tblPr.append(tblW)
 
-    # Borders
     tblBorders = OxmlElement('w:tblBorders')
     for side in ["top", "left", "bottom", "right"]:
         el = OxmlElement(f"w:{side}")
         el.set(qn('w:val'), 'single')
-        el.set(qn('w:sz'), '8')        # ~1 pt border
+        el.set(qn('w:sz'), '8')
         el.set(qn('w:space'), '0')
         el.set(qn('w:color'), '000000')
         tblBorders.append(el)
     tblPr.append(tblBorders)
 
-    # Tight cell padding
     cellMar = OxmlElement('w:tblCellMar')
     for side in ('top', 'left', 'bottom', 'right'):
         mar = OxmlElement(f'w:{side}')
-        mar.set(qn('w:w'), '40')       # 40 twips ≈ 0.028"
+        mar.set(qn('w:w'), '40')  # 40 twips ≈ 0.028"
         mar.set(qn('w:type'), 'dxa')
         cellMar.append(mar)
     tblPr.append(cellMar)
 
-    # Row 1: Name (bold, right-aligned)
+    # Name row
     cell_name = table.cell(0, 0)
     p_name = cell_name.paragraphs[0]
     p_name.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
@@ -768,7 +795,7 @@ def add_name_job_rectangle(doc, name: str, job_title: str):
     run_name.font.bold = True
     run_name.font.color.rgb = RGBColor(0, 0, 0)
 
-    # Row 2: Job title (right-aligned, tight spacing)
+    # Job title row
     cell_job = table.cell(1, 0)
     p_job = cell_job.paragraphs[0]
     p_job.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
@@ -782,117 +809,309 @@ def add_name_job_rectangle(doc, name: str, job_title: str):
 
 def add_section_heading(doc, text: str):
     p = doc.add_paragraph()
+    p.paragraph_format.left_indent = Inches(0)
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after = Pt(6)
     run = p.add_run(text.upper())
     run.font.name = 'Arial'
-    run.font.size = Pt(16)  # 16pt per requirement
+    run.font.size = Pt(16)
     run.font.bold = True
     return p
 
-# --- employer/project formatting helpers
-_ROLE_WORDS = re.compile(r"(?i)\b(engineer|technician|supervisor|manager|inspector|consultant|specialist|lead|senior|qa/qc|commission(?:ing)?|construction|site|hook[-\s]?up|e&?i|electrical|mechanical)\b")
-
-def _clean_employer_only(company_raw: str) -> str:
-    """keep company name only even if role-like text is mixed in."""
-    s = first_text(company_raw)
-    if not s:
-        return s
-    for kw in [" at ", " for ", " with "]:
-        if kw in s.lower():
-            left, right = re.split(kw, s, flags=re.I, maxsplit=1)
-            if _ROLE_WORDS.search(left):
-                s = right
-    if "," in s:
-        parts = [p.strip() for p in s.split(",")]
-        if parts and _ROLE_WORDS.search(parts[0]) and len(parts) >= 2:
-            s = parts[-1]
-    return re.sub(r"\s{2,}", " ", s).strip(" .-")
-
-def write_personal_block(doc, personal_ordered):
-    add_section_heading(doc, "PERSONAL DATA")
+# ---- Shared key/value table builder (3 columns: label / ":" / value)
+def _add_kv_table(doc, rows: List[Tuple[str, str]], first_col_width=1.3, colon_width=0.15, value_width=4.5):
     table = doc.add_table(rows=0, cols=3)
     table.autofit = False
-    table.columns[0].width = Inches(1.3)
-    table.columns[1].width = Inches(0.15)
-    table.columns[2].width = Inches(4.5)
-
-    for label, value in personal_ordered:
-        val = first_text(value)
-        if not val:
-            continue
+    table.columns[0].width = Inches(first_col_width)
+    table.columns[1].width = Inches(colon_width)
+    table.columns[2].width = Inches(value_width)
+    _clear_table_borders(table)
+    for label, value in rows:
         row = table.add_row().cells
+        # label
         p0 = row[0].paragraphs[0]
-        r0 = p0.add_run(label)
-        r0.font.name = 'Arial'
-        r0.font.size = Pt(10)
-        r0.bold = False
-
+        p0.paragraph_format.space_before = Pt(0)
+        p0.paragraph_format.space_after = Pt(0)
+        r0 = p0.add_run(first_text(label))
+        r0.font.name = 'Arial'; r0.font.size = Pt(10); r0.bold = True if label else False
+        # colon
         p1 = row[1].paragraphs[0]
+        p1.paragraph_format.space_before = Pt(0)
+        p1.paragraph_format.space_after = Pt(0)
         r1 = p1.add_run(":")
-        r1.font.name = 'Arial'
-        r1.font.size = Pt(10)
-
+        r1.font.name = 'Arial'; r1.font.size = Pt(10)
+        # value
         p2 = row[2].paragraphs[0]
-        r2 = p2.add_run(val)
-        r2.font.name = 'Arial'
-        r2.font.size = Pt(10)
+        p2.paragraph_format.space_before = Pt(0)
+        p2.paragraph_format.space_after = Pt(0)
+        r2 = p2.add_run(first_text(value))
+        r2.font.name = 'Arial'; r2.font.size = Pt(10)
+    return table
 
+# ---- Remove borders helper
+def _clear_table_borders(table):
+    tbl = table._element
+    tblPr = tbl.tblPr or OxmlElement('w:tblPr')
+    borders = OxmlElement('w:tblBorders')
+    for side in ["top", "left", "bottom", "right", "insideH", "insideV"]:
+        el = OxmlElement(f"w:{side}")
+        el.set(qn('w:val'), 'nil')
+        borders.append(el)
+    tblPr.append(borders)
+    if tbl.tblPr is None:
+        tbl.insert(0, tblPr)
+
+# ---- Rich KV table (supports list bullets)
+def _add_kv_table_rich(doc, rows, first_col_width=1.2, colon_width=0.15, value_width=5.0):
+    table = doc.add_table(rows=0, cols=3)
+    table.autofit = False
+    table.columns[0].width = Inches(first_col_width)
+    table.columns[1].width = Inches(colon_width)
+    table.columns[2].width = Inches(value_width)
+    _clear_table_borders(table)
+
+    for label, value in rows:
+        cells = table.add_row().cells
+
+        # Label (bold)
+        p0 = cells[0].paragraphs[0]
+        p0.paragraph_format.space_before = Pt(0)
+        p0.paragraph_format.space_after = Pt(0)
+        r0 = p0.add_run(first_text(label))
+        r0.font.name = 'Arial'; r0.font.size = Pt(10); r0.bold = True
+
+        # Colon
+        p1 = cells[1].paragraphs[0]
+        p1.paragraph_format.space_before = Pt(0)
+        p1.paragraph_format.space_after = Pt(0)
+        r1 = p1.add_run(":")
+        r1.font.name = 'Arial'; r1.font.size = Pt(10)
+
+        # Value (string or bullet list)
+        p2 = cells[2].paragraphs[0]
+        p2.paragraph_format.space_before = Pt(0)
+        p2.paragraph_format.space_after = Pt(0)
+
+        if isinstance(value, list):
+            if value:
+                r = p2.add_run("• " + first_text(value[0]))
+                r.font.name = 'Arial'; r.font.size = Pt(10)
+            for line in value[1:]:
+                para = cells[2].add_paragraph()
+                para.paragraph_format.space_before = Pt(0)
+                para.paragraph_format.space_after = Pt(0)
+                run = para.add_run("• " + first_text(line))
+                run.font.name = 'Arial'; run.font.size = Pt(10)
+        else:
+            r2 = p2.add_run(first_text(value))
+            r2.font.name = 'Arial'; r2.font.size = Pt(10)
+
+    return table
+
+# ---- Field code helper for PAGE/NUMPAGES
+def _add_field_code(paragraph, instr_text: str):
+    """
+    Insert a simple field (e.g., PAGE, NUMPAGES) using w:fldSimple.
+    """
+    fld = OxmlElement('w:fldSimple')
+    fld.set(qn('w:instr'), instr_text)
+    r = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+    r.append(rPr)
+    t = OxmlElement('w:t')
+    t.text = "1"  # placeholder; Word will update
+    r.append(t)
+    fld.append(r)
+    paragraph._p.append(fld)
+
+# ---- Hyperlink helper
+def add_hyperlink(paragraph, url: str, text: str):
+    """Insert a real clickable hyperlink (blue + underline) into a paragraph."""
+    part = paragraph.part
+    r_id = part.relate_to(
+        url,
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        is_external=True
+    )
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('r:id'), r_id)
+
+    new_run = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+    color = OxmlElement('w:color'); color.set(qn('w:val'), '0000FF')
+    u = OxmlElement('w:u'); u.set(qn('w:val'), 'single')
+    rPr.append(color); rPr.append(u)
+    new_run.append(rPr)
+
+    t = OxmlElement('w:t'); t.text = text
+    new_run.append(t)
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
+    return paragraph
+
+# ---- Footer styled like reference
+def set_footer_style(doc, left_text: str = "www.egyptrol.com", updated_text: Optional[str] = None):
+    """
+    Footer: thin gray top rule + three columns
+    Left: blue underlined hyperlink, Center: 'Page X of Y', Right: 'Updated: Mon. YYYY'
+    Compatible with older python-docx that requires width argument.
+    """
+    section = doc.sections[0]
+    footer = section.footer
+    content_w_in = section.page_width.inches - section.left_margin.inches - section.right_margin.inches
+
+    # Separator line (1x1 table with only top border)
+    try:
+        sep_tbl = footer.add_table(rows=1, cols=1)
+    except TypeError:
+        sep_tbl = footer.add_table(rows=1, cols=1, width=Inches(content_w_in))
+    sep_el = sep_tbl._element
+    sepPr = sep_el.tblPr or OxmlElement('w:tblPr')
+    sepW = OxmlElement('w:tblW'); sepW.set(qn('w:w'), str(int(content_w_in * 1440))); sepW.set(qn('w:type'), 'dxa')
+    sepPr.append(sepW)
+    borders = OxmlElement('w:tblBorders')
+    for side in ["top","left","bottom","right","insideH","insideV"]:
+        el = OxmlElement(f"w:{side}")
+        if side == "top":
+            el.set(qn('w:val'), 'single')
+            el.set(qn('w:sz'), '6')
+            el.set(qn('w:space'), '0')
+            el.set(qn('w:color'), 'B7B7B7')
+        else:
+            el.set(qn('w:val'), 'nil')
+        borders.append(el)
+    sepPr.append(borders)
+    if sep_el.tblPr is None:
+        sep_el.insert(0, sepPr)
+    # remove extra spacing
+    spara = sep_tbl.rows[0].cells[0].paragraphs[0]
+    spara.paragraph_format.space_before = Pt(0)
+    spara.paragraph_format.space_after = Pt(0)
+
+    # Main footer table (1 row, 3 cols)
+    try:
+        tbl = footer.add_table(rows=1, cols=3)
+    except TypeError:
+        tbl = footer.add_table(rows=1, cols=3, width=Inches(content_w_in))
+
+    tbl_el = tbl._element
+    tblPr = tbl_el.tblPr or OxmlElement('w:tblPr')
+    tblW = OxmlElement('w:tblW'); tblW.set(qn('w:w'), str(int(content_w_in * 1440))); tblW.set(qn('w:type'), 'dxa')
+    tblPr.append(tblW)
+    # clear borders
+    b = OxmlElement('w:tblBorders')
+    for side in ["top","left","bottom","right","insideH","insideV"]:
+        el = OxmlElement(f"w:{side}"); el.set(qn('w:val'), 'nil'); b.append(el)
+    tblPr.append(b)
+    if tbl_el.tblPr is None:
+        tbl_el.insert(0, tblPr)
+
+    c0, c1, c2 = tbl.rows[0].cells
+
+    # Left (hyperlink)
+    p0 = c0.paragraphs[0]; p0.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+    p0.paragraph_format.space_before = Pt(2); p0.paragraph_format.space_after = Pt(0)
+    if left_text:
+        url = "http://" + left_text.replace("http://","").replace("https://","")
+        add_hyperlink(p0, url, left_text)
+
+    # Center (Page X of Y)
+    p1 = c1.paragraphs[0]; p1.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+    p1.paragraph_format.space_before = Pt(2); p1.paragraph_format.space_after = Pt(0)
+    r1a = p1.add_run("Page "); r1a.font.name = 'Arial'; r1a.font.size = Pt(9)
+    _add_field_code(p1, "PAGE")
+    r1b = p1.add_run(" of "); r1b.font.name = 'Arial'; r1b.font.size = Pt(9)
+    _add_field_code(p1, "NUMPAGES")
+
+    # Right (Updated)
+    if updated_text is None:
+        updated_text = "Updated: " + datetime.now().strftime("%b. %Y")
+    p2 = c2.paragraphs[0]; p2.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
+    p2.paragraph_format.space_before = Pt(2); p2.paragraph_format.space_after = Pt(0)
+    r2 = p2.add_run(updated_text); r2.font.name = 'Arial'; r2.font.size = Pt(9)
+
+# ====== Writers ======
+def write_personal_block(doc, personal_ordered):
+    add_section_heading(doc, "PERSONAL DATA")
+    _add_kv_table(doc, personal_ordered)
+    doc.add_paragraph("")
+
+def write_education_block(doc, items: List[str]):
+    items = [first_text(x) for x in (items or []) if first_text(x) and first_text(x).lower() != "not specified"]
+    if not items:
+        return
+    add_section_heading(doc, "EDUCATION")
+    rows = [("", it) for it in items]
+    _add_kv_table(doc, rows)
+    doc.add_paragraph("")
+
+def write_languages_block(doc, items: List[str]):
+    items = [first_text(x) for x in (items or []) if first_text(x)]
+    if not items:
+        return
+    add_section_heading(doc, "LANGUAGES")
+    rows: List[Tuple[str, str]] = []
+    for it in items:
+        m = re.split(r"[:\-–]\s*", it, maxsplit=1)
+        if len(m) == 2:
+            lang, lvl = m[0].strip(), m[1].strip()
+        else:
+            lang, lvl = it.strip(), ""
+        rows.append((lang, lvl))
+    _add_kv_table(doc, rows)
     doc.add_paragraph("")
 
 def write_list_block(doc, title: str, items: List[str]):
+    items = [first_text(s) for s in (items or []) if first_text(s) and first_text(s).lower() != "not specified"]
     if not items:
         return
     add_section_heading(doc, title)
     for s in items:
-        s = first_text(s)
-        if s and s.lower() != "not specified":
-            para = doc.add_paragraph()
-            run = para.add_run("• " + s)
-            run.font.name = 'Arial'
-            run.font.size = Pt(10)
+        para = doc.add_paragraph()
+        para.paragraph_format.space_before = Pt(0)
+        para.paragraph_format.space_after = Pt(0)
+        run = para.add_run("• " + s)
+        run.font.name = 'Arial'
+        run.font.size = Pt(10)
     doc.add_paragraph("")
 
+# Exact style match (colon-aligned list like your reference)
+def write_colon_list_block(doc, title: str, items: List[str]):
+    items = [first_text(s) for s in (items or []) if first_text(s)]
+    if not items:
+        return
+    add_section_heading(doc, title)
+    rows = [("", s) for s in items]
+    _add_kv_table(doc, rows)  # renders as empty label | ":" | value
+    doc.add_paragraph("")
+
+# ---- EXPERIENCE
 def write_experience_block(doc, roles: List[dict]):
     if not roles:
         return
+
     add_section_heading(doc, "CHRONOLOGICAL EXPERIENCE RECORD")
 
-    def add_kv(label: str, value: str):
-        v = first_text(value)
-        if not v or v.lower() == "not specified":
-            return
-        p = doc.add_paragraph()
-        r1 = p.add_run(f"{label} : ")
-        r1.font.name = 'Arial'; r1.font.size = Pt(10); r1.bold = True
-        r2 = p.add_run(v)
-        r2.font.name = 'Arial'; r2.font.size = Pt(10)
-
-    def clean(items):
+    def clean_list(items):
         out, seen = [], set()
         for x in items or []:
             s = first_text(x).rstrip(" ,.;:-")
-            if not s:
-                continue
-            low = s.lower()
-            if low not in seen and low != "not specified":
-                seen.add(low)
-                out.append(s)
+            if s and s.lower() not in seen and s.lower() != "not specified":
+                seen.add(s.lower()); out.append(s)
         return out
 
     proj_name_pat = re.compile(r"(?i)\bProject\s*(?:Name|Title)?\s*[:\-]\s*(.+)")
 
-    def split_project(name_or_line: str) -> (str, str):
-        t = first_text(name_or_line)
-        if not t:
-            return "", ""
+    def split_project(line: str) -> (str, str):
+        t = first_text(line)
+        if not t: return "", ""
         if "(" in t and ")" in t:
             pre = t.split("(", 1)[0].strip(" -,:;")
             par = t.split("(", 1)[1].rsplit(")", 1)[0].strip()
-            if pre:
-                return pre, par
+            if pre: return pre, par
         if " - " in t:
             parts = [p.strip(" -,:;") for p in t.split(" - ") if p.strip()]
-            if parts:
-                return parts[0], " - ".join(parts[1:]) if len(parts) > 1 else ""
+            if parts: return parts[0], " - ".join(parts[1:]) if len(parts) > 1 else ""
         if "," in t:
             a, b = t.split(",", 1)
             return a.strip(" -,:;"), b.strip()
@@ -900,67 +1119,56 @@ def write_experience_block(doc, roles: List[dict]):
 
     for r in roles:
         duration = first_text(r.get("Duration"))
-        company  = _clean_employer_only(first_text(r.get("Company")))
-        position = first_text(r.get("Position"))
-        tasks    = clean(r.get("Tasks") or [])
+        company  = first_text(r.get("Company"))
+        position = first_text(r.get("Position") or "Role not specified")
+        tasks    = clean_list(r.get("Tasks"))
 
-        project_name, project_brief = "", ""
-        new_tasks = []
+        # lift any project lines out of tasks
+        project_lines: List[str] = []
+        kept_tasks = []
         for t in tasks:
             m = proj_name_pat.search(t)
-            if m and not project_name:
-                pn, pb = split_project(m.group(1))
-                project_name, project_brief = pn, pb
-                continue
-            new_tasks.append(t)
-        tasks = new_tasks
+            if m:
+                name, brief = split_project(m.group(1))
+                project_lines.append(name + (" – " + brief if brief else ""))
+            else:
+                kept_tasks.append(t)
+        tasks = kept_tasks
 
-        if not project_name and tasks:
-            candidate_name, candidate_brief = split_project(tasks[0])
-            used_first = False
-            if len(candidate_name.split()) >= 2:
-                project_name = candidate_name
-                project_brief = project_brief or candidate_brief
-                used_first = True
-            elif not project_brief:
-                project_brief = tasks[0]
-                used_first = True
-            if used_first:
+        if not project_lines and tasks:
+            name, brief = split_project(tasks[0])
+            if len(name.split()) >= 2:
+                project_lines.append(name + (" – " + brief if brief else ""))
                 tasks = tasks[1:]
 
-        if project_name and project_brief:
-            project_line = f"{project_name} – {project_brief}"
-        elif project_name:
-            project_line = project_name
-        else:
-            project_line = project_brief
+        rows = []
+        if duration: rows.append(("Dates", duration))
+        if company:  rows.append(("Employer", company))
+        if project_lines:
+            rows.append(("Projects" if len(project_lines) > 1 else "Project",
+                         project_lines if len(project_lines) > 1 else project_lines[0]))
+        if position: rows.append(("Job title", position))
+        if tasks:    rows.append(("Job Description", tasks))
 
-        add_kv("Dates", duration)
-        add_kv("Employer", company)
-        if project_line:
-            add_kv("Project", project_line)
-        add_kv("Job title", position)
-
-        if tasks:
-            p = doc.add_paragraph()
-            rlbl = p.add_run("Job Description :")
-            rlbl.font.name = 'Arial'; rlbl.font.size = Pt(10); rlbl.bold = True
-            for t in tasks:
-                para = doc.add_paragraph()
-                run = para.add_run(f"- {t}")
-                run.font.name = 'Arial'; run.font.size = Pt(10)
-
-        doc.add_paragraph("")
+        if rows:
+            _add_kv_table_rich(doc, rows, first_col_width=1.2, colon_width=0.15, value_width=5.0)
+            spacer = doc.add_paragraph()
+            spacer.paragraph_format.space_before = Pt(4)
+            spacer.paragraph_format.space_after = Pt(2)
 
 def write_field_of_experience_block(doc, items: List[str]):
     items = [first_text(x) for x in (items or []) if first_text(x)]
     if not items:
         return
     p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
     r = p.add_run("Field of experience :")
     r.font.name = 'Arial'; r.font.size = Pt(10); r.bold = True
     for it in items:
         para = doc.add_paragraph()
+        para.paragraph_format.space_before = Pt(0)
+        para.paragraph_format.space_after = Pt(0)
         run = para.add_run(f"• {it}")
         run.font.name = 'Arial'; run.font.size = Pt(10)
     doc.add_paragraph("")
@@ -990,8 +1198,7 @@ def consolidate_structures(llm_out: Dict[str, Any], cv_text: str) -> Dict[str, A
     headline = first_text(llm_out.get("headline")) or strong_pi.get("Headline", "")
 
     edu = sections.get("EDUCATION") or extract_education_from_text(cv_text)
-    else_edu = [e for e in edu if "No Languages" not in str(e)]
-    edu = else_edu
+    edu = [e for e in edu if "No Languages" not in str(e)]
 
     langs = sections.get("LANGUAGES") or extract_languages_from_text(cv_text)
 
@@ -1007,7 +1214,14 @@ def consolidate_structures(llm_out: Dict[str, Any], cv_text: str) -> Dict[str, A
                 continue
             fixed.append({
                 "Company": first_text(r.get("Company")),
-                "Position": first_text(r.get("Position")) or "Role not specified",
+                # accept common alias keys; still default to "Role not specified"
+                "Position": first_text(
+                    r.get("Position")
+                    or r.get("Job title")
+                    or r.get("Title")
+                    or r.get("Designation")
+                    or r.get("Role")
+                ) or "Role not specified",
                 "Duration": first_text(r.get("Duration")),
                 "Location": first_text(r.get("Location")),
                 "Tasks": [first_text(t) for t in (r.get("Tasks") or []) if first_text(t)]
@@ -1057,7 +1271,6 @@ def process_cv(file_path: str, job_title: str = ""):
     cv_text = "\n".join(text_blocks)
 
     parsed = mistral_parse_cv(cv_text)
-
     merged = consolidate_structures(parsed or {}, cv_text)
 
     strong_pi = extract_personal_info_from_text(cv_text)
@@ -1074,7 +1287,7 @@ def process_cv(file_path: str, job_title: str = ""):
     doc_out = docx.Document()
     set_page_margins(doc_out, top=0.69, bottom=0.87, left=0.87, right=0.87)
 
-    # Header box (styling only)
+    # Header box
     add_name_job_rectangle(
         doc_out,
         merged.get("name", ""),
@@ -1082,6 +1295,7 @@ def process_cv(file_path: str, job_title: str = ""):
     )
     doc_out.add_paragraph("")
 
+    # PERSONAL DATA
     pdata = merged.get("personal_data", {}) or {}
     contacts = merged.get("contacts", {}) or {}
     personal_ordered = [
@@ -1092,14 +1306,24 @@ def process_cv(file_path: str, job_title: str = ""):
     ]
     write_personal_block(doc_out, personal_ordered)
 
+    # EDUCATION
     sections = merged.get("sections", {})
-    write_list_block(doc_out, "EDUCATION", sections.get("EDUCATION") or [])
-    write_list_block(doc_out, "LANGUAGES", sections.get("LANGUAGES") or [])
-    write_list_block(doc_out, "COMPUTER SKILLS", sections.get("COMPUTER SKILLS") or [])
-    write_list_block(doc_out, "TRAINING COURSES AND CERTIFICATIONS", sections.get("TRAINING COURSES AND CERTIFICATIONS") or [])
+    write_education_block(doc_out, sections.get("EDUCATION") or [])
+
+    # LANGUAGES
+    write_languages_block(doc_out, sections.get("LANGUAGES") or [])
+
+    # Computer Skills & Training → colon-aligned tables (like your reference)
+    write_colon_list_block(doc_out, "COMPUTER SKILLS", sections.get("COMPUTER SKILLS") or [])
+    write_colon_list_block(doc_out, "TRAINING COURSES AND CERTIFICATIONS", sections.get("TRAINING COURSES AND CERTIFICATIONS") or [])
+
+    # EXPERIENCE
     write_experience_block(doc_out, sections.get("CHRONOLOGICAL EXPERIENCE RECORD") or [])
+
+    # Optional field
     write_field_of_experience_block(doc_out, sections.get("FIELD OF EXPERIENCE"))
 
+    # Any extra sections (unchanged)
     core = {"EDUCATION","LANGUAGES","COMPUTER SKILLS","TRAINING COURSES AND CERTIFICATIONS","CHRONOLOGICAL EXPERIENCE RECORD","FIELD OF EXPERIENCE"}
     for sec_name, items in sections.items():
         if sec_name in core:
@@ -1118,6 +1342,9 @@ def process_cv(file_path: str, job_title: str = ""):
                         if first_text(str(v2)):
                             flat.append(f"{k2}: {v2}")
             write_list_block(doc_out, sec_name, flat)
+
+    # Footer (match reference)
+    set_footer_style(doc_out, left_text="www.egyptrol.com", updated_text=None)
 
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     output_path = os.path.join(OUTPUT_DIR, f"{base_name}_parsed.docx")
